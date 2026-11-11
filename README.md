@@ -27,26 +27,24 @@ iOS는 Safari가 백그라운드로 이동하거나 기기가 잠기면 웹 실�
 
 ## 설치 저장소 배포
 
-프로젝트 루트에서 GitHub CLI 로그인을 마친 뒤 배포 스크립트를 실행하면 기본 저장소인 `pigeo-on2/randle-mobile-installer`를 갱신합니다. 기존 저장소를 복제한 뒤 userscript, 업데이트 메타데이터, README와 라이선스를 복사하고 변경이 있을 때만 커밋하고 푸시합니다.
+프로젝트 루트에서 배포 스크립트를 실행하면 기본 저장소인 `pigeo-on2/randle-mobile-installer`를 갱신합니다. 기존 저장소를 복제한 뒤 userscript, 업데이트 메타데이터, README와 라이선스를 복사하고 변경이 있을 때만 커밋하고 푸시합니다. GitHub에 푸시할 수 있는 Git 자격 증명이 설정되어 있어야 합니다.
 
-Windows PowerShell:
+Windows:
 
-```powershell
-gh auth login --hostname github.com --git-protocol https --web
-.\scripts\publish-mobile-installer.ps1
+```bat
+publish-mobile-installer.cmd
 ```
 
 macOS 또는 Linux:
 
 ```bash
-gh auth login --hostname github.com --git-protocol https --web
-./scripts/publish-mobile-installer.sh
+bash scripts/publish-mobile-installer.sh
 ```
 
-다른 저장소에 배포하려면 첫 번째 인수 또는 `-TargetRepo`를 사용합니다.
+다른 저장소에 배포하려면 첫 번째 인수 또는 PowerShell의 `-Repository`를 사용합니다.
 
 ```powershell
-.\scripts\publish-mobile-installer.ps1 -TargetRepo owner/repository
+.\scripts\publish-mobile-installer.ps1 -Repository owner/repository
 ```
 
 ```bash
