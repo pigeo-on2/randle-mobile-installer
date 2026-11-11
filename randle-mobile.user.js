@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Randle Auto Mobile
 // @namespace    https://randle.lixx.kr/
-// @version      1.0.5
+// @version      1.0.6
 // @description  iOS Safari에서 Randle 자동 진행과 인간 인증을 처리합니다.
 // @match        https://randle.lixx.kr/*
 // @inject-into  page
@@ -23,8 +23,10 @@
 (() => {
   'use strict';
 
+  const APP_VERSION = '1.0.6';
   if (window.__randleAutoMobile) return;
-  window.__randleAutoMobile = true;
+  const runtimeStatus = { version: APP_VERSION, humanAuto: true };
+  window.__randleAutoMobile = runtimeStatus;
   if (!globalThis.protobuf) {
     console.error('[Randle Auto Mobile] protobuf.js를 불러오지 못했습니다.');
     return;
@@ -516,13 +518,24 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     }
     return new Promise((resolve, reject) => {
       const image = new Image();
-      image.addEventListener('load', () => resolve(image), { once: true });
-      image.addEventListener('error', () => reject(new Error('인간 인증 이미지를 불러오지 못했습니다.')), { once: true });
+      const timer = setTimeout(() => reject(new Error('인간 인증 이미지 로딩 시간이 초과됐습니다.')), 5_000);
+      image.addEventListener('load', () => {
+        clearTimeout(timer);
+        resolve(image);
+      }, { once: true });
+      image.addEventListener('error', () => {
+        clearTimeout(timer);
+        reject(new Error('인간 인증 이미지를 불러오지 못했습니다.'));
+      }, { once: true });
       image.src = url;
     });
   }
 
+  const rawImageCache = new Map();
+
   async function rawImage(source, resize = null) {
+    const cacheKey = `${resize?.width || 'natural'}x${resize?.height || 'natural'}:${source}`;
+    if (rawImageCache.has(cacheKey)) return rawImageCache.get(cacheKey);
     const image = await loadChallengeImage(source);
     const width = resize?.width || image.naturalWidth;
     const height = resize?.height || image.naturalHeight;
@@ -533,7 +546,10 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     const context = canvas.getContext('2d', { willReadFrequently: true });
     if (!context) throw new Error('이미지 판독 기능을 사용할 수 없습니다.');
     context.drawImage(image, 0, 0, width, height);
-    return { data: context.getImageData(0, 0, width, height).data, width, height };
+    const result = { data: context.getImageData(0, 0, width, height).data, width, height };
+    rawImageCache.set(cacheKey, result);
+    if (rawImageCache.size > 8) rawImageCache.delete(rawImageCache.keys().next().value);
+    return result;
   }
 
   function pixel(image, x, y) {
@@ -586,8 +602,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
 
   async function paletteChoice(challenge) {
     if (challenge.choiceCount < 4) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
+    const [current, reference] = await Promise.all([rawImage(challenge.image), rawImage(challenge.reference)]);
     const paints = [
       averageColor(current, Math.round(current.width / 4), Math.round(current.height * 0.28), Math.max(8, Math.round(current.width / 14))),
       averageColor(current, Math.round(current.width * 3 / 4), Math.round(current.height * 0.28), Math.max(8, Math.round(current.width / 14))),
@@ -655,8 +670,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
 
   async function lockChoice(challenge) {
     if (challenge.choiceCount < 4 || !challenge.reference) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
+    const [current, reference] = await Promise.all([rawImage(challenge.image), rawImage(challenge.reference)]);
     const decorations = Math.min(3, challenge.choiceCount - 1);
     for (let index = 0; index < decorations; index += 1) {
       const currentKind = decorationKind(regionFeatures(current,
@@ -678,8 +692,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
 
   async function recipeChoice(challenge) {
     if (challenge.choiceCount < 3 || !challenge.reference) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
+    const [current, reference] = await Promise.all([rawImage(challenge.image), rawImage(challenge.reference)]);
     const snackCount = challenge.choiceCount - 1;
     const currentKinds = Array.from({ length: snackCount }, (_, index) => snackKind(regionFeatures(current,
       Math.floor(index * current.width / snackCount), Math.floor((index + 1) * current.width / snackCount))));
@@ -784,6 +797,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
           return { restart: true, strategy: 'attempt-budget' };
         }
         const challenge = solverChallenge(human);
+        logger(`인간 인증 자동 풀이 시작 (${challenge.kind || 'unknown'})`);
         let index = null;
         let strategy = null;
         try {
@@ -1063,7 +1077,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     <button id="ram-toggle" type="button" aria-label="Randle Auto 열기">R</button>
     <section id="ram-panel" hidden>
       <header class="ram-header">
-        <div class="ram-title"><span>PURE iOS · SAME-ORIGIN</span><strong>Randle Auto</strong></div>
+        <div class="ram-title"><span>PURE iOS · v${APP_VERSION}</span><strong>Randle Auto</strong></div>
         <button id="ram-close" class="ram-icon" type="button" aria-label="닫기">✕</button>
       </header>
       <div class="ram-scroll">
@@ -1101,7 +1115,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     humanImage: $('#ram-human-image'), reference: $('#ram-reference'), choices: $('#ram-choices'),
   };
 
-  const SETTINGS_KEY = 'randle-auto-mobile-settings-v1';
+  const SETTINGS_KEY = 'randle-auto-mobile-settings-v2';
   let runningClient = null;
   let runningController = null;
   let humanPending = null;
@@ -1134,7 +1148,9 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
   }
 
   function renderState(state) {
-    const status = state?.human?.required ? '인증 진행 중' : state?.round?.status || (state?.can_start ? '시작 가능' : '연결됨');
+    const status = state?.human?.required
+      ? (runtimeStatus.humanAuto ? '인증 자동 풀이' : '인증 답변 대기')
+      : state?.round?.status || (state?.can_start ? '시작 가능' : '연결됨');
     elements.phase.textContent = status;
     const score = /^\d+$/.test(state?.round?.result?.score || '') ? state.round.result.score : state?.rp || '—';
     elements.score.textContent = score;
@@ -1197,7 +1213,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     const settings = {
       rounds: Number(data.get('rounds')),
       strategy: String(data.get('strategy')),
-      humanAuto: data.has('humanAuto'),
+      humanAuto: Boolean(elements.form.elements.namedItem('humanAuto')?.checked),
     };
     if (!Number.isInteger(settings.rounds) || settings.rounds < 1 || settings.rounds > 10_000) throw new Error('라운드 수는 1~10,000이어야 합니다.');
     if (!['rp', 'duplicates', 'confirm'].includes(settings.strategy)) throw new Error('올바른 전략을 선택하세요.');
@@ -1230,6 +1246,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       return;
     }
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    runtimeStatus.humanAuto = settings.humanAuto;
     roundsCompleted = 0;
     roundsTarget = settings.rounds;
     elements.rounds.textContent = `0 / ${roundsTarget}`;
@@ -1293,5 +1310,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
 
   restoreSettings();
   setRunning(false);
-  log('Safari 세션 준비 완료. 쿠키 값은 읽거나 표시하지 않습니다.');
+  log(`v${APP_VERSION} Safari 세션 준비 완료. 인간 인증 자동 풀이가 기본 활성화됐습니다.`);
+  log('쿠키 값은 읽거나 표시하지 않습니다.');
 })();
