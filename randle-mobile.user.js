@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Randle Auto Mobile
 // @namespace    https://randle.lixx.kr/
-// @version      1.0.5
+// @version      1.0.4
 // @description  iOS Safari에서 Randle 자동 진행과 인간 인증을 처리합니다.
 // @match        https://randle.lixx.kr/*
 // @inject-into  page
@@ -110,7 +110,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       super(error?.message || '게임 요청에 실패했습니다.');
       this.name = 'GameResponseError';
       this.code = Number(error?.code || 0);
-      this.syncedState = null;
     }
   }
 
@@ -126,8 +125,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       this.connectPromise = null;
       this.reconnectTimer = null;
       this.reconnectAttempts = 0;
-      this.recoverySyncRequired = false;
-      this.recoveryRequestId = null;
       this.stopped = true;
     }
 
@@ -163,8 +160,8 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
 
         socket.addEventListener('open', () => {
           clearTimeout(timer);
-          if (this.recoverySyncRequired) this.sendRecoverySync();
-          else for (const entry of this.pending.values()) this.sendBuffer(entry.buffer);
+          this.reconnectAttempts = 0;
+          for (const entry of this.pending.values()) this.sendBuffer(entry.buffer);
           resolve();
         }, { once: true });
         socket.addEventListener('message', (event) => this.handleMessage(event.data));
@@ -178,10 +175,12 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
           clearTimeout(timer);
           if (this.socket === socket) this.socket = null;
           if (this.stopped) return;
-          const policyRejected = event.code === 1008;
-          if (policyRejected || this.recoveryRequestId) this.recoverySyncRequired = true;
-          this.recoveryRequestId = null;
-          this.scheduleReconnect(policyRejected ? 2_000 : 0);
+          if (event.code === 1008) {
+            this.rejectPending(new Error('서버가 현재 Safari 세션을 거부했습니다.'));
+            this.stopped = true;
+            return;
+          }
+          this.scheduleReconnect();
         }, { once: true });
       }).finally(() => {
         this.connectPromise = null;
@@ -233,28 +232,9 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
         this.socket?.close();
         return;
       }
-      if (this.reconnectAttempts > 0) this.reconnectAttempts = 0;
       if (response.state) {
         this.state = response.state;
         for (const listener of this.stateListeners) listener(response.state);
-      }
-      if (response.request_id === this.recoveryRequestId) {
-        this.recoveryRequestId = null;
-        this.recoverySyncRequired = false;
-        this.reconnectAttempts = 0;
-        if (response.error?.message) {
-          this.rejectPending(new GameResponseError(response.error));
-          return;
-        }
-        if (response.state?.human?.required) {
-          for (const [requestIdValue, entry] of this.pending) {
-            this.pending.delete(requestIdValue);
-            entry.resolve(response);
-          }
-          return;
-        }
-        for (const entry of this.pending.values()) this.sendBuffer(entry.buffer);
-        return;
       }
       const pending = this.pending.get(response.request_id);
       if (pending) {
@@ -263,24 +243,19 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       }
     }
 
-    scheduleReconnect(minimumDelay = 0) {
+    scheduleReconnect() {
       if (this.stopped || this.reconnectTimer || this.connectPromise) return;
       if (this.reconnectAttempts >= this.maxReconnects) {
         this.rejectPending(new Error('재연결 한도에 도달했습니다.'));
         this.stopped = true;
         return;
       }
-      const delay = Math.max(minimumDelay, Math.min(10_000, 500 * (2 ** this.reconnectAttempts)));
+      const delay = Math.min(10_000, 500 * (2 ** this.reconnectAttempts));
       this.reconnectAttempts += 1;
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
-        this.connect().catch(() => this.scheduleReconnect(minimumDelay));
+        this.connect().catch(() => this.scheduleReconnect());
       }, delay);
-    }
-
-    sendRecoverySync() {
-      this.recoveryRequestId = requestId();
-      this.sendBuffer(encodeClient({ request_id: this.recoveryRequestId, action: ACTION.SYNC }));
     }
 
     rejectPending(error) {
@@ -292,8 +267,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       this.stopped = true;
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
-      this.recoverySyncRequired = false;
-      this.recoveryRequestId = null;
       if (this.socket && this.socket.readyState < WebSocket.CLOSING) this.socket.close(1000);
       this.rejectPending(new Error('연결이 종료됐습니다.'));
     }
@@ -488,328 +461,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     return best;
   }
 
-  function solverChallenge(human) {
-    return {
-      challengeKey: String(human.id || ''),
-      kind: human.kind,
-      phase: human.phase,
-      progress: human.progress,
-      total: human.total,
-      image: human.image,
-      reference: human.reference,
-      scene: human.scene,
-      labels: [...(human.labels || [])],
-      trayLabels: [...(human.tray_labels || [])],
-      choiceCount: (human.choices || []).length,
-      disabledChoices: [...(human.disabled_choices || [])],
-      selectedChoices: [...(human.selected_choices || [])],
-    };
-  }
-
-  function loadChallengeImage(source) {
-    if (typeof source !== 'string' || !source) return Promise.reject(new Error('인간 인증 이미지가 없습니다.'));
-    let url = source;
-    if (!source.startsWith('data:')) {
-      const parsed = new URL(source, window.location.origin);
-      if (parsed.origin !== window.location.origin) return Promise.reject(new Error('허용되지 않은 이미지 주소입니다.'));
-      url = parsed.href;
-    }
-    return new Promise((resolve, reject) => {
-      const image = new Image();
-      image.addEventListener('load', () => resolve(image), { once: true });
-      image.addEventListener('error', () => reject(new Error('인간 인증 이미지를 불러오지 못했습니다.')), { once: true });
-      image.src = url;
-    });
-  }
-
-  async function rawImage(source, resize = null) {
-    const image = await loadChallengeImage(source);
-    const width = resize?.width || image.naturalWidth;
-    const height = resize?.height || image.naturalHeight;
-    if (!width || !height) throw new Error('인간 인증 이미지 크기가 올바르지 않습니다.');
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext('2d', { willReadFrequently: true });
-    if (!context) throw new Error('이미지 판독 기능을 사용할 수 없습니다.');
-    context.drawImage(image, 0, 0, width, height);
-    return { data: context.getImageData(0, 0, width, height).data, width, height };
-  }
-
-  function pixel(image, x, y) {
-    const offset = (y * image.width + x) * 4;
-    return [image.data[offset], image.data[offset + 1], image.data[offset + 2]];
-  }
-
-  function colorDistance(left, right) {
-    return Math.sqrt(left.reduce((sum, value, index) => sum + ((value - right[index]) ** 2), 0));
-  }
-
-  function averageColor(image, centerX, centerY, radius) {
-    const samples = [];
-    for (let y = Math.max(0, centerY - radius); y <= Math.min(image.height - 1, centerY + radius); y += 1) {
-      for (let x = Math.max(0, centerX - radius); x <= Math.min(image.width - 1, centerX + radius); x += 1) {
-        const rgb = pixel(image, x, y);
-        const brightness = rgb.reduce((sum, value) => sum + value, 0) / 3;
-        if (Math.max(...rgb) - Math.min(...rgb) > 18 && brightness > 75 && brightness < 235) samples.push(rgb);
-      }
-    }
-    if (!samples.length) throw new Error('색상 정보를 찾지 못했습니다.');
-    return [0, 1, 2].map((channel) => samples.reduce((sum, rgb) => sum + rgb[channel], 0) / samples.length);
-  }
-
-  async function bridgeChoice(challenge) {
-    const current = await rawImage(challenge.image);
-    const scene = await rawImage(challenge.scene, current);
-    const yMin = Math.round(current.height * 92 / 180);
-    const yMax = Math.min(current.height, Math.round(current.height * 170 / 180));
-    const radius = Math.max(8, Math.round(current.width * 30 / 360));
-    for (let index = 0; index < challenge.choiceCount; index += 1) {
-      const center = Math.round(current.width * (50 + (64 * index)) / 360);
-      const points = [];
-      for (let y = yMin; y < yMax; y += 1) {
-        for (let x = Math.max(0, center - radius); x <= Math.min(current.width - 1, center + radius); x += 1) {
-          const left = pixel(current, x, y);
-          const right = pixel(scene, x, y);
-          if (Math.max(...left.map((value, channel) => Math.abs(value - right[channel]))) > 65) points.push([x, y]);
-        }
-      }
-      if (!points.length) continue;
-      const xs = points.map(([x]) => x);
-      const ys = points.map(([, y]) => y);
-      const boundsWidth = Math.max(...xs) - Math.min(...xs) + 1;
-      const boundsHeight = Math.max(...ys) - Math.min(...ys) + 1;
-      if (boundsHeight > boundsWidth * 1.3 && !challenge.disabledChoices.includes(index)) return index;
-    }
-    return null;
-  }
-
-  async function paletteChoice(challenge) {
-    if (challenge.choiceCount < 4) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
-    const paints = [
-      averageColor(current, Math.round(current.width / 4), Math.round(current.height * 0.28), Math.max(8, Math.round(current.width / 14))),
-      averageColor(current, Math.round(current.width * 3 / 4), Math.round(current.height * 0.28), Math.max(8, Math.round(current.width / 14))),
-    ];
-    const targets = [
-      averageColor(reference, Math.round(reference.width / 4), Math.round(reference.height / 2), Math.max(8, Math.round(reference.width / 14))),
-      averageColor(reference, Math.round(reference.width * 3 / 4), Math.round(reference.height / 2), Math.max(8, Math.round(reference.width / 14))),
-    ];
-    const plan = targets.map((target, targetIndex) => ({
-      paint: colorDistance(target, paints[0]) <= colorDistance(target, paints[1]) ? 0 : 1,
-      target: targetIndex + 2,
-    }));
-    const step = plan[Math.min(Number(challenge.progress || 0), plan.length - 1)];
-    return challenge.selectedChoices.includes(step.paint) ? step.target : step.paint;
-  }
-
-  async function differenceChoice(challenge) {
-    if (challenge.choiceCount < 2 || !challenge.reference) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference, current);
-    const scores = Array.from({ length: challenge.choiceCount }, () => 0);
-    const counts = Array.from({ length: challenge.choiceCount }, () => 0);
-    for (let y = 0; y < current.height; y += 1) {
-      for (let x = 0; x < current.width; x += 1) {
-        const section = Math.min(challenge.choiceCount - 1, Math.floor(x * challenge.choiceCount / current.width));
-        const left = pixel(current, x, y);
-        const right = pixel(reference, x, y);
-        scores[section] += left.reduce((sum, value, channel) => sum + Math.abs(value - right[channel]), 0);
-        counts[section] += 3;
-      }
-    }
-    const averages = scores.map((score, index) => score / Math.max(1, counts[index]));
-    return averages.indexOf(Math.max(...averages));
-  }
-
-  function regionFeatures(image, xMin, xMax, yMin = 0, yMax = image.height) {
-    const features = { pixels: 0, saturated: 0, dark: 0, orange: 0, pink: 0, green: 0 };
-    for (let y = Math.max(0, yMin); y < Math.min(image.height, yMax); y += 1) {
-      for (let x = Math.max(0, xMin); x < Math.min(image.width, xMax); x += 1) {
-        const [red, green, blue] = pixel(image, x, y);
-        const maximum = Math.max(red, green, blue);
-        const minimum = Math.min(red, green, blue);
-        const average = (red + green + blue) / 3;
-        features.pixels += 1;
-        if (maximum - minimum <= 25 || maximum >= 250) continue;
-        features.saturated += 1;
-        if (average < 125) features.dark += 1;
-        if (red > green + 20 && green > blue + 12 && red > 130) features.orange += 1;
-        if (red > green + 20 && blue > green + 3 && red > 140) features.pink += 1;
-        if (green > red + 3 && green > blue + 3 && green > 90) features.green += 1;
-      }
-    }
-    return features;
-  }
-
-  function featureRatio(features, name) {
-    return features[name] / Math.max(1, features.pixels);
-  }
-
-  function decorationKind(features) {
-    if (featureRatio(features, 'orange') > 0.04) return 'moon';
-    if (featureRatio(features, 'pink') > 0.12) return 'star';
-    return 'bat';
-  }
-
-  async function lockChoice(challenge) {
-    if (challenge.choiceCount < 4 || !challenge.reference) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
-    const decorations = Math.min(3, challenge.choiceCount - 1);
-    for (let index = 0; index < decorations; index += 1) {
-      const currentKind = decorationKind(regionFeatures(current,
-        Math.floor(index * current.width / decorations), Math.floor((index + 1) * current.width / decorations)));
-      const targetKind = decorationKind(regionFeatures(reference,
-        Math.floor(index * reference.width / decorations), Math.floor((index + 1) * reference.width / decorations)));
-      if (currentKind !== targetKind) return index;
-    }
-    const confirm = challenge.labels.findIndex((label) => String(label).includes('확인'));
-    return confirm >= 0 ? confirm : challenge.choiceCount - 1;
-  }
-
-  function snackKind(features, reference = false) {
-    if (featureRatio(features, 'green') > 0.0015) return 'milk';
-    if (featureRatio(features, 'orange') > (reference ? 0.075 : 0.04)) return 'moon';
-    if (featureRatio(features, 'dark') > 0.022) return 'candy';
-    return 'star';
-  }
-
-  async function recipeChoice(challenge) {
-    if (challenge.choiceCount < 3 || !challenge.reference) return null;
-    const current = await rawImage(challenge.image);
-    const reference = await rawImage(challenge.reference);
-    const snackCount = challenge.choiceCount - 1;
-    const currentKinds = Array.from({ length: snackCount }, (_, index) => snackKind(regionFeatures(current,
-      Math.floor(index * current.width / snackCount), Math.floor((index + 1) * current.width / snackCount))));
-    const targetKinds = Array.from({ length: 2 }, (_, index) => snackKind(regionFeatures(reference,
-      Math.floor(index * reference.width / 2), Math.floor((index + 1) * reference.width / 2)), true));
-    const targetIndexes = targetKinds.map((kind) => currentKinds.indexOf(kind));
-    if (targetIndexes.some((index) => index < 0) || new Set(targetIndexes).size !== targetIndexes.length) return null;
-    const next = targetIndexes.find((index) => !challenge.selectedChoices.includes(index));
-    if (Number.isInteger(next)) return next;
-    const confirm = challenge.labels.findIndex((label) => String(label).includes('확인'));
-    return confirm >= 0 ? confirm : challenge.choiceCount - 1;
-  }
-
-  async function towerChoice(challenge) {
-    if (challenge.choiceCount < 3 || challenge.trayLabels.length !== challenge.choiceCount) return null;
-    const goal = challenge.trayLabels.findIndex((label) => String(label).includes('도착'));
-    if (goal < 0) return null;
-    const current = await rawImage(challenge.image);
-    const scores = Array.from({ length: challenge.choiceCount }, (_, index) => regionFeatures(current,
-      Math.floor(index * current.width / challenge.choiceCount), Math.floor((index + 1) * current.width / challenge.choiceCount),
-      Math.floor(current.height * 0.08), Math.floor(current.height * 0.58)).saturated);
-    const big = scores.indexOf(Math.max(...scores));
-    const remaining = scores.map((score, index) => ({ score, index }))
-      .filter(({ index }) => index !== big).sort((left, right) => right.score - left.score);
-    const threshold = Math.max(current.width * current.height * 0.002, scores[big] * 0.08);
-    const small = remaining[0]?.score > threshold ? remaining[0].index : big;
-    const spare = (excluded) => scores.findIndex((_, index) => !excluded.includes(index));
-    let move = null;
-    if (big !== goal && (small === big || small === goal)) move = { source: small, destination: spare([big, goal]) };
-    else if (big !== goal) move = { source: big, destination: goal };
-    else if (small !== goal) move = { source: small, destination: goal };
-    if (!move || move.destination < 0) return null;
-    return challenge.selectedChoices.length ? move.destination : move.source;
-  }
-
-  function strongestRow(histogram, radius) {
-    const smoothed = histogram.map((_, index) => histogram.slice(Math.max(0, index - radius), index + radius + 1)
-      .reduce((sum, value) => sum + value, 0));
-    const score = Math.max(...smoothed);
-    return { row: smoothed.indexOf(score), score };
-  }
-
-  async function scaleChoice(challenge) {
-    if (challenge.choiceCount < 3 || !challenge.scene) return null;
-    const current = await rawImage(challenge.image);
-    const scene = await rawImage(challenge.scene, current);
-    const yMin = Math.floor(current.height * 0.23);
-    const yMax = Math.floor(current.height * 0.44);
-    const rows = [[0.22, 0.44], [0.635, 0.825]].map(([start, end]) => {
-      const histogram = Array.from({ length: current.height }, () => 0);
-      for (let y = yMin; y < yMax; y += 1) {
-        for (let x = Math.floor(current.width * start); x < Math.floor(current.width * end); x += 1) {
-          const rgb = pixel(current, x, y);
-          const base = pixel(scene, x, y);
-          const changed = Math.max(...rgb.map((value, channel) => Math.abs(value - base[channel])));
-          const [red, green, blue] = rgb;
-          if (changed > 45 && red > 85 && red > green * 1.05 && green > blue * 1.12 && red - blue > 40) histogram[y] += 1;
-        }
-      }
-      return strongestRow(histogram, Math.max(2, Math.round(current.height * 0.01)));
-    });
-    if (rows.some(({ score }) => score < current.width * 0.25)) return null;
-    const remove = challenge.labels.findIndex((label) => String(label).includes('빼기'));
-    const add = challenge.labels.findIndex((label) => String(label).includes('더하기'));
-    const confirm = challenge.labels.findIndex((label) => String(label).includes('확인'));
-    if ([remove, add, confirm].some((index) => index < 0)) return null;
-    const difference = rows[0].row - rows[1].row;
-    if (difference > Math.max(3, current.height * 0.012)) return add;
-    if (difference < -Math.max(3, current.height * 0.012)) return remove;
-    return confirm;
-  }
-
-  function humanStateSignature(challenge) {
-    return [challenge.challengeKey, challenge.kind, challenge.phase, challenge.progress, challenge.choiceCount,
-      challenge.disabledChoices.join(','), challenge.selectedChoices.join(','), challenge.labels.join(','),
-      challenge.trayLabels.join(',')].join('|');
-  }
-
-  function oracleChoice(challenge, attemptedByState) {
-    const disabled = new Set(challenge.disabledChoices);
-    const selected = new Set(challenge.selectedChoices);
-    const order = Array.from({ length: challenge.choiceCount }, (_, index) => index)
-      .filter((index) => !disabled.has(index) && !selected.has(index))
-      .concat(Array.from(selected).filter((index) => !disabled.has(index)));
-    const signature = humanStateSignature(challenge);
-    const attempted = attemptedByState.get(signature) || new Set();
-    attemptedByState.set(signature, attempted);
-    const index = order.find((candidate) => !attempted.has(candidate));
-    if (index === undefined) return { restart: true, strategy: 'progress-oracle' };
-    attempted.add(index);
-    return { index, strategy: 'progress-oracle' };
-  }
-
-  function createMobileHumanSolver({ maxAttempts = 80, logger = () => {} } = {}) {
-    const attemptedByState = new Map();
-    let attempts = 0;
-    return {
-      async solve(human) {
-        if (attempts >= maxAttempts) {
-          attempts = 0;
-          attemptedByState.clear();
-          return { restart: true, strategy: 'attempt-budget' };
-        }
-        const challenge = solverChallenge(human);
-        let index = null;
-        let strategy = null;
-        try {
-          if (challenge.kind === 'bridge') { index = await bridgeChoice(challenge); strategy = 'bridge-image-diff'; }
-          else if (challenge.kind === 'palette') { index = await paletteChoice(challenge); strategy = 'palette-color-match'; }
-          else if (challenge.kind === 'difference') { index = await differenceChoice(challenge); strategy = 'difference-image-diff'; }
-          else if (challenge.kind === 'lock') { index = await lockChoice(challenge); strategy = 'lock-reference-match'; }
-          else if (challenge.kind === 'recipe') { index = await recipeChoice(challenge); strategy = 'recipe-reference-match'; }
-          else if (challenge.kind === 'tower') { index = await towerChoice(challenge); strategy = 'tower-move-plan'; }
-          else if (challenge.kind === 'scale') { index = await scaleChoice(challenge); strategy = 'scale-beam-angle'; }
-        } catch {
-          logger(`${challenge.kind} 이미지 판독 실패, 진행 상태 탐색으로 전환`);
-        }
-        const decision = Number.isInteger(index) ? { index, strategy } : oracleChoice(challenge, attemptedByState);
-        if (Number.isInteger(decision.index)) {
-          attempts += 1;
-          logger(`인간 인증 자동 선택 ${decision.index + 1}/${challenge.choiceCount} (${challenge.kind}, ${decision.strategy})`);
-        } else if (decision.restart) {
-          attempts = 0;
-          attemptedByState.clear();
-        }
-        return decision;
-      },
-    };
-  }
-
   function stoppedError() {
     const error = new Error('실행이 중지됐습니다.');
     error.name = 'AbortError';
@@ -841,11 +492,8 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
   async function sendAction(client, action, state, extra = {}) {
     const response = await client.request(action, roundFields(state, extra));
     if (response.error?.message) {
-      const syncedState = response.state || await client.sync();
-      if (syncedState?.human?.required || Number(response.error.code) === 409) return syncedState;
-      const error = new GameResponseError(response.error);
-      error.syncedState = syncedState;
-      throw error;
+      if (Number(response.error.code) === 409) return client.sync();
+      throw new GameResponseError(response.error);
     }
     return response.state || client.sync();
   }
@@ -873,14 +521,8 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
         if (state.human?.required && state.human.revision === human.revision) await sleep(250, signal);
         continue;
       }
-      const decision = await solveHuman(human, signal);
+      const index = await solveHuman(human, signal);
       throwIfStopped(signal);
-      if (decision && typeof decision === 'object' && decision.restart === true) {
-        logger(`인간 인증 새 문제 요청 (${human.kind})`);
-        state = await sendAction(client, ACTION.CHALLENGE, state, { restart: true });
-        continue;
-      }
-      const index = Number.isInteger(decision) ? decision : decision?.index;
       if (!Number.isInteger(index) || index < 0 || index >= human.choices.length) throw new Error('올바른 인간 인증 선택지가 아닙니다.');
       if (human.disabled_choices.includes(index)) throw new Error('비활성화된 인간 인증 선택지입니다.');
       logger(`인간 인증 ${human.progress + 1}/${human.total || '?'} 답변 전송`);
@@ -890,8 +532,8 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
         });
       } catch (error) {
         if (!(error instanceof GameResponseError)) throw error;
-        logger('인간 인증 답변이 만료되어 최신 상태를 불러옵니다.');
-        state = error.syncedState || await client.sync();
+        logger('인간 인증 답변이 만료되어 새 문제를 불러옵니다.');
+        state = await client.sync();
       }
     }
     return state;
@@ -1026,8 +668,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       .ram-card h3 { margin: 0; font-size: 15px; }
       .ram-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
       label { display: grid; gap: 6px; color: #cfc6dc; font-size: 12px; }
-      .ram-check { display: flex; align-items: center; gap: 9px; margin-top: 12px; }
-      .ram-check input { width: 18px; height: 18px; margin: 0; accent-color: #ad8aff; }
       input, select { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; color: #f7f3ff; background: #0c0912; }
       .ram-actions { display: flex; gap: 9px; margin-top: 13px; }
       .ram-actions button, .ram-choice { min-height: 44px; border: 0; border-radius: 11px; font-weight: 750; }
@@ -1077,7 +717,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
             <label>라운드 수<input name="rounds" type="number" min="1" max="10000" value="1" required></label>
             <label>전략<select name="strategy"><option value="rp">RP 기대값</option><option value="duplicates">중복 유지</option><option value="confirm">즉시 확정</option></select></label>
           </div>
-          <label class="ram-check"><input name="humanAuto" type="checkbox" checked>인간 인증 자동 풀이</label>
           <div class="ram-actions"><button id="ram-start" type="submit">시작</button><button id="ram-stop" type="button" disabled>중지</button></div>
           <p id="ram-message"></p>
         </form>
@@ -1147,7 +786,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     setImage(elements.reference, null);
   }
 
-  function promptHuman(human, signal) {
+  function solveHuman(human, signal) {
     if (humanPending) return Promise.reject(new Error('이미 인간 인증 답변을 기다리고 있습니다.'));
     openPanel();
     elements.phase.textContent = '인증 진행 중';
@@ -1197,7 +836,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     const settings = {
       rounds: Number(data.get('rounds')),
       strategy: String(data.get('strategy')),
-      humanAuto: data.has('humanAuto'),
     };
     if (!Number.isInteger(settings.rounds) || settings.rounds < 1 || settings.rounds > 10_000) throw new Error('라운드 수는 1~10,000이어야 합니다.');
     if (!['rp', 'duplicates', 'confirm'].includes(settings.strategy)) throw new Error('올바른 전략을 선택하세요.');
@@ -1210,8 +848,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       if (!saved) return;
       for (const [name, value] of Object.entries(saved)) {
         const field = elements.form.elements.namedItem(name);
-        if (field?.type === 'checkbox' && value !== undefined) field.checked = Boolean(value);
-        else if (field && value !== undefined) field.value = value;
+        if (field && value !== undefined) field.value = value;
       }
     } catch {
       // Ignore invalid local preferences.
@@ -1237,7 +874,6 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     setRunning(true);
     const controller = new AbortController();
     const client = new BrowserRandleClient({ logger: { error: log }, requestTimeoutMs: 30_000, maxReconnects: 8 });
-    const automaticHumanSolver = createMobileHumanSolver({ logger: log });
     runningController = controller;
     runningClient = client;
     const removeStateListener = client.onState(renderState);
@@ -1254,7 +890,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
           sampledOutcomes: 256,
           maxRerollPositions: 8,
         },
-        solveHuman: settings.humanAuto ? (human) => automaticHumanSolver.solve(human) : promptHuman,
+        solveHuman,
         onProgress: ({ roundsCompleted: completed, score }) => {
           roundsCompleted = completed;
           elements.rounds.textContent = `${completed} / ${roundsTarget}`;
