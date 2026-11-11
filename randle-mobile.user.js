@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Randle Auto Mobile
 // @namespace    https://randle.lixx.kr/
-// @version      1.0.3
+// @version      1.0.4
 // @description  iOS Safari에서 Randle 자동 진행과 인간 인증을 처리합니다.
 // @match        https://randle.lixx.kr/*
 // @inject-into  page
@@ -504,14 +504,13 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     if (waitMs > 0) await sleep(waitMs, signal);
   }
 
-  async function resolveHumanCheck(client, state, solveHuman, maxWaitMs, logger, signal) {
+  async function resolveHumanCheck(client, state, solveHuman, logger, signal) {
     if (!state.human?.required) return state;
-    for (let step = 0; step < 32 && state.human?.required; step += 1) {
+    while (state.human?.required) {
       throwIfStopped(signal);
       const human = state.human;
       if (human.phase === 'cooldown') {
         const waitMs = Math.max(0, Number(human.ready_at || 0) - Number(state.server_time || 0)) + 80;
-        if (waitMs > maxWaitMs) throw new Error(`인간 인증 재시도 대기가 설정 한도보다 깁니다. (${Math.ceil(waitMs / 1000)}초)`);
         logger(`인간 인증 재시도까지 ${Math.ceil(waitMs / 1000)}초 대기`);
         await sleep(waitMs, signal);
         state = await sendAction(client, ACTION.CHALLENGE, state, { restart: true });
@@ -519,6 +518,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       }
       if (!human.id || !human.choices.length) {
         state = await sendAction(client, ACTION.CHALLENGE, state);
+        if (state.human?.required && state.human.revision === human.revision) await sleep(250, signal);
         continue;
       }
       const index = await solveHuman(human, signal);
@@ -526,11 +526,16 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       if (!Number.isInteger(index) || index < 0 || index >= human.choices.length) throw new Error('올바른 인간 인증 선택지가 아닙니다.');
       if (human.disabled_choices.includes(index)) throw new Error('비활성화된 인간 인증 선택지입니다.');
       logger(`인간 인증 ${human.progress + 1}/${human.total || '?'} 답변 전송`);
-      state = await sendAction(client, ACTION.ANSWER, state, {
-        human: { id: human.id, revision: human.revision, choice: human.choices[index] },
-      });
+      try {
+        state = await sendAction(client, ACTION.ANSWER, state, {
+          human: { id: human.id, revision: human.revision, choice: human.choices[index] },
+        });
+      } catch (error) {
+        if (!(error instanceof GameResponseError)) throw error;
+        logger('인간 인증 답변이 만료되어 새 문제를 불러옵니다.');
+        state = await client.sync();
+      }
     }
-    if (state.human?.required) throw new Error('인간 인증 단계 한도를 초과했습니다.');
     return state;
   }
 
@@ -556,7 +561,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     let activeRoundId = state.round && state.round.status !== 'confirmed' ? state.round.id : null;
     while (roundsCompleted < rounds) {
       throwIfStopped(signal);
-      state = await resolveHumanCheck(client, state, solveHuman, maxWaitMs, logger, signal);
+      state = await resolveHumanCheck(client, state, solveHuman, logger, signal);
       if (activeRoundId && state.round?.id === activeRoundId && state.round.status === 'confirmed') {
         activeRoundId = null;
         roundsCompleted += 1;
@@ -660,11 +665,10 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       .ram-stat span { display: block; color: #a99fba; font-size: 11px; }
       .ram-stat strong { display: block; overflow: hidden; margin-top: 4px; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
       .ram-card { margin-top: 10px; padding: 14px; border: 1px solid rgba(185,152,255,.18); border-radius: 16px; background: rgba(255,255,255,.025); }
-      .ram-card h3 { margin: 0 0 12px; font-size: 15px; }
+      .ram-card h3 { margin: 0; font-size: 15px; }
       .ram-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
       label { display: grid; gap: 6px; color: #cfc6dc; font-size: 12px; }
       input, select { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; color: #f7f3ff; background: #0c0912; }
-      .ram-wide { grid-column: 1/-1; }
       .ram-actions { display: flex; gap: 9px; margin-top: 13px; }
       .ram-actions button, .ram-choice { min-height: 44px; border: 0; border-radius: 11px; font-weight: 750; }
       #ram-start { flex: 1; color: #150c24; background: linear-gradient(135deg,#ccb5ff,#9c75f7); }
@@ -678,8 +682,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
         background: #120f1b; box-shadow: 0 28px 80px rgba(0,0,0,.7); pointer-events: auto;
       }
       .ram-human-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-      .ram-human-title h3 { margin-bottom: 2px; }
-      .ram-human-title p { margin: 0 0 12px; color: #ffd78c; font-size: 11px; }
+      .ram-human-head h3 { margin: 0; }
       #ram-human-instruction { margin: 0 0 12px; color: #f5edf9; white-space: pre-wrap; }
       .ram-image { display: block; width: 100%; max-height: 38vh; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; object-fit: contain; background: #f5efe5; }
       #ram-reference { margin-top: 8px; max-height: 20vh; }
@@ -689,14 +692,11 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
       .ram-choice span:last-child { overflow-wrap: anywhere; color: #d5c9e2; font-size: 11px; }
       .ram-choice[data-selected="true"] { color: #180e27; background: #b99aff; }
       .ram-choice[data-selected="true"] span:last-child { color: #2a183e; }
-      #ram-log { max-height: 160px; overflow: auto; margin: 0; padding: 0; list-style: none; color: #c7bdcf; font: 11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-      #ram-log li { padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.05); overflow-wrap: anywhere; }
       @media (min-width: 700px) {
         #ram-panel { left: auto; width: min(430px,calc(100vw - 16px)); }
       }
       @media (max-width: 390px) {
         .ram-grid { grid-template-columns: 1fr; }
-        .ram-wide { grid-column: auto; }
         #ram-choices { grid-template-columns: repeat(auto-fit,minmax(82px,1fr)); }
       }
     </style>
@@ -713,28 +713,20 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
           <div class="ram-stat"><span>현재 RP</span><strong id="ram-score">—</strong></div>
         </div>
         <form id="ram-form" class="ram-card">
-          <h3>자동 실행</h3>
           <div class="ram-grid">
             <label>라운드 수<input name="rounds" type="number" min="1" max="10000" value="1" required></label>
             <label>전략<select name="strategy"><option value="rp">RP 기대값</option><option value="duplicates">중복 유지</option><option value="confirm">즉시 확정</option></select></label>
-            <label>라운드 간 대기(초)<input name="roundDelay" type="number" min="0" max="3600" value="0" required></label>
-            <label>목표 RP<input name="stopScore" inputmode="numeric" pattern="[0-9]*" placeholder="사용 안 함"></label>
-            <label>최대 서버 대기(초)<input name="maxWait" type="number" min="1" max="3600" value="120" required></label>
-            <label>RP 최소 상승률(%)<input name="minGain" type="number" min="0" max="100" step="0.1" value="2" required></label>
-            <label>RP 표본 수<input name="samples" type="number" min="64" max="8192" value="256" required></label>
-            <label>최대 리롤 칸<input name="maxRerolls" type="number" min="1" max="8" value="8" required></label>
           </div>
           <div class="ram-actions"><button id="ram-start" type="submit">시작</button><button id="ram-stop" type="button" disabled>중지</button></div>
           <p id="ram-message"></p>
         </form>
         <section id="ram-human" class="ram-card" hidden>
-          <div class="ram-human-head"><div class="ram-human-title"><h3>인간 인증</h3><p>자동화 일시 정지 · 답변 후 자동 재개</p></div><strong id="ram-human-progress">—</strong></div>
+          <div class="ram-human-head"><h3>인간 인증</h3><strong id="ram-human-progress">—</strong></div>
           <p id="ram-human-instruction"></p>
           <img id="ram-human-image" class="ram-image" alt="인간 인증 문제" hidden>
           <img id="ram-reference" class="ram-image" alt="참조 이미지" hidden>
           <div id="ram-choices"></div>
         </section>
-        <section class="ram-card"><h3>실행 로그</h3><ol id="ram-log"></ol></section>
       </div>
     </section>
   `;
@@ -745,7 +737,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     start: $('#ram-start'), stop: $('#ram-stop'), message: $('#ram-message'), phase: $('#ram-phase'),
     rounds: $('#ram-rounds'), score: $('#ram-score'), human: $('#ram-human'),
     humanProgress: $('#ram-human-progress'), humanInstruction: $('#ram-human-instruction'),
-    humanImage: $('#ram-human-image'), reference: $('#ram-reference'), choices: $('#ram-choices'), log: $('#ram-log'),
+    humanImage: $('#ram-human-image'), reference: $('#ram-reference'), choices: $('#ram-choices'),
   };
 
   const SETTINGS_KEY = 'randle-auto-mobile-settings-v1';
@@ -761,11 +753,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
   elements.close.addEventListener('click', closePanel);
 
   function log(message) {
-    const item = document.createElement('li');
-    item.textContent = `${new Date().toLocaleTimeString('ko-KR')}  ${String(message)}`;
-    elements.log.append(item);
-    while (elements.log.children.length > 100) elements.log.firstElementChild.remove();
-    elements.log.scrollTop = elements.log.scrollHeight;
+    console.info('[Randle Auto Mobile]', String(message));
   }
 
   function setRunning(running) {
@@ -785,7 +773,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
   }
 
   function renderState(state) {
-    const status = state?.human?.required ? '인증 대기' : state?.round?.status || (state?.can_start ? '시작 가능' : '연결됨');
+    const status = state?.human?.required ? '인증 진행 중' : state?.round?.status || (state?.can_start ? '시작 가능' : '연결됨');
     elements.phase.textContent = status;
     const score = /^\d+$/.test(state?.round?.result?.score || '') ? state.round.result.score : state?.rp || '—';
     elements.score.textContent = score;
@@ -801,7 +789,7 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
   function solveHuman(human, signal) {
     if (humanPending) return Promise.reject(new Error('이미 인간 인증 답변을 기다리고 있습니다.'));
     openPanel();
-    elements.phase.textContent = '인증 답변 대기';
+    elements.phase.textContent = '인증 진행 중';
     elements.human.hidden = false;
     elements.humanProgress.textContent = human.total ? `${human.progress + 1} / ${human.total}` : String(human.progress + 1);
     elements.humanInstruction.textContent = human.instruction || '올바른 답을 선택하세요.';
@@ -848,21 +836,9 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
     const settings = {
       rounds: Number(data.get('rounds')),
       strategy: String(data.get('strategy')),
-      roundDelay: Number(data.get('roundDelay')),
-      stopScore: String(data.get('stopScore') || '').trim(),
-      maxWait: Number(data.get('maxWait')),
-      minGain: Number(data.get('minGain')),
-      samples: Number(data.get('samples')),
-      maxRerolls: Number(data.get('maxRerolls')),
     };
     if (!Number.isInteger(settings.rounds) || settings.rounds < 1 || settings.rounds > 10_000) throw new Error('라운드 수는 1~10,000이어야 합니다.');
     if (!['rp', 'duplicates', 'confirm'].includes(settings.strategy)) throw new Error('올바른 전략을 선택하세요.');
-    if (!Number.isFinite(settings.roundDelay) || settings.roundDelay < 0 || settings.roundDelay > 3_600) throw new Error('라운드 대기는 0~3,600초여야 합니다.');
-    if (settings.stopScore && !/^\d{1,30}$/.test(settings.stopScore)) throw new Error('목표 RP는 30자리 이하의 정수여야 합니다.');
-    if (!Number.isFinite(settings.maxWait) || settings.maxWait < 1 || settings.maxWait > 3_600) throw new Error('최대 대기는 1~3,600초여야 합니다.');
-    if (!Number.isFinite(settings.minGain) || settings.minGain < 0 || settings.minGain > 100) throw new Error('최소 상승률은 0~100%여야 합니다.');
-    if (!Number.isInteger(settings.samples) || settings.samples < 64 || settings.samples > 8_192) throw new Error('표본 수는 64~8,192여야 합니다.');
-    if (!Number.isInteger(settings.maxRerolls) || settings.maxRerolls < 1 || settings.maxRerolls > 8) throw new Error('최대 리롤 칸은 1~8이어야 합니다.');
     return settings;
   }
 
@@ -906,13 +882,13 @@ message ServerMessage { string request_id = 1; State state = 2; Error error = 3;
         client,
         rounds: settings.rounds,
         strategy: settings.strategy,
-        maxWaitMs: settings.maxWait * 1_000,
-        roundDelayMs: settings.roundDelay * 1_000,
-        stopScore: settings.stopScore || null,
+        maxWaitMs: 3_600_000,
+        roundDelayMs: 0,
+        stopScore: null,
         strategyOptions: {
-          minExpectedGainPercent: settings.minGain,
-          sampledOutcomes: settings.samples,
-          maxRerollPositions: settings.maxRerolls,
+          minExpectedGainPercent: 2,
+          sampledOutcomes: 256,
+          maxRerollPositions: 8,
         },
         solveHuman,
         onProgress: ({ roundsCompleted: completed, score }) => {
